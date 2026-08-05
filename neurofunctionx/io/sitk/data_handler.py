@@ -32,3 +32,11 @@ def _load_dicom(dicom_dir: str) -> sitk.Image:
 
 def save_volume(image: sitk.Image, path: str):
     sitk.WriteImage(image, path)
+
+
+def load_transform(path) -> sitk.Transform:
+    return sitk.ReadTransform(str(path))
+
+
+def save_transform(transform: sitk.Transform, path: str):
+    sitk.WriteTransform(transform, str(path))

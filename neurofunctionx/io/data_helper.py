@@ -20,6 +20,9 @@ def save_any_file(file, file_path: Path):
     if ext in ("nii.gz", "mha", "nrrd"):
         from neurofunctionx.io.sitk.data_handler import save_volume
         save_volume(file, str(file_path))
+    elif ext in ("h5", "hdf5", "tfm"):
+        from neurofunctionx.io.sitk.data_handler import save_transform
+        save_transform(file, str(file_path))
     elif ext == "vtu":
         from neurofunctionx.io.vtk.file_handler import write_vtk
         write_vtk(file, str(file_path))
@@ -37,6 +40,9 @@ def load_any_file(file_path):
     if ext in ("nii.gz", "mha", "nrrd"):
         from neurofunctionx.io.sitk.data_handler import load_volume
         return load_volume(file_path)
+    elif ext in ("h5", "hdf5", "tfm"):
+        from neurofunctionx.io.sitk.data_handler import load_transform
+        return load_transform(file_path)
     elif ext == "vtu":
         from neurofunctionx.io.vtk.file_handler import read_vtk
         return read_vtk(str(file_path))
