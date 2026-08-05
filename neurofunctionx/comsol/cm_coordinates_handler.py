@@ -13,6 +13,24 @@ def get_tissue_conductivity_values(img: sitk.Image):
     top3_values = sorted([item for item, count in counted_values.most_common(3)])
     return np.round(top3_values, decimals=5)
 
+def finalize_conductivity_cube(cond_img: sitk.Image, reference_img: sitk.Image) -> sitk.Image:
+    """Prepare a raw conductivity image for COMSOL.
+
+    Copies the reference image's orientation, crops to the centre cube and
+    replaces background (0) voxels with the gray-matter conductivity, since
+    COMSOL cannot handle zero-conductivity regions.
+    """
+    from neurofunctionx.io.sitk.image_transform import extract_center_cube
+
+    cond_img.SetOrigin(reference_img.GetOrigin())
+    cond_img.SetDirection(reference_img.GetDirection())
+
+    tissue_conductivities = get_tissue_conductivity_values(cond_img)
+    cond_img = extract_center_cube(cond_img)
+    cond_img[cond_img == 0.0] = tissue_conductivities[1]  # background -> gray matter
+    return cond_img
+
+
 def create_cm_dict_from_sitk(img: sitk.Image):
 
     size = np.array(img.GetSize())

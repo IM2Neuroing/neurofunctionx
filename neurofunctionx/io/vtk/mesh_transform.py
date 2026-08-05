@@ -61,3 +61,26 @@ def sample_interpolated(mesh_points, mesh_values, ref_img):
     img = sitk.GetImageFromArray(img_np)
     img.CopyInformation(ref_img)
     return img
+
+
+def transform_mesh_points(mesh, origin, direction, transform=None, scale=1000.0):
+    """Move a VTK mesh's points into an image's physical space.
+
+    Scales the mesh coordinates (``scale``, metres->mm by default), rotates them
+    by the image ``direction`` and shifts by ``origin``; then optionally applies a
+    further SimpleITK ``transform`` point-by-point. Returns the same mesh with its
+    points replaced.
+    """
+    import vtk
+    import vtkmodules.util.numpy_support as nps
+
+    coords = nps.vtk_to_numpy(mesh.GetPoints().GetData())
+    coords = (coords * scale) @ np.asarray(direction).reshape(3, 3).T + np.asarray(origin)
+    if transform is not None:
+        coords = np.array([transform.TransformPoint(p.tolist()) for p in coords])
+
+    points = vtk.vtkPoints()
+    points.SetData(nps.numpy_to_vtk(coords, deep=1))
+    mesh.SetPoints(points)
+    mesh.Modified()
+    return mesh

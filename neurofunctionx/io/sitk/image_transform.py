@@ -198,7 +198,8 @@ def shift_image_by_intensity_center(sitk_volume: sitk.Image, percentile=20):
     return resampled
 
 
-def transform_to_another_image_space(image_path, reference_image_path, transform: sitk.Transform):
+def transform_to_another_image_space(image_path, reference_image_path, transform: sitk.Transform,
+                                     interpolator=sitk.sitkLinear):
     image = load_volume(image_path)
     reference_image = load_volume(reference_image_path)
 
@@ -206,7 +207,7 @@ def transform_to_another_image_space(image_path, reference_image_path, transform
         image,
         reference_image,  # (defines grid)
         transform,
-        sitk.sitkLinear,
+        interpolator,  # sitkLinear for intensities, sitkNearestNeighbor for labels
         0.0,
         image.GetPixelID()
     )
