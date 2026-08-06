@@ -35,8 +35,11 @@ thread count, cgroup memory limit and temp-directory filesystem in the log.
 Logging goes through :class:`BaseProcessor` like everywhere else in the
 package, so ``BaseProcessor.configure_logging()`` controls it.
 """
+import faulthandler
+import multiprocessing
 import os
 import platform
+import signal
 import sys
 import tempfile
 import threading
@@ -50,6 +53,7 @@ import SimpleITK as sitk
 
 from neurofunctionx.core.BaseProcessor import BaseProcessor
 from neurofunctionx.io.sitk.data_handler import load_volume
+from neurofunctionx.io.sitk.image_transform import resample_to_spacing
 
 ImageOrPath = Union[sitk.Image, str, Path]
 
@@ -96,13 +100,14 @@ def _read_text(path: str) -> Optional[str]:
         return None
 
 
-def _process_memory() -> dict:
-    """Current and peak resident set size of this process, in bytes.
+def _process_memory(pid: Union[int, str] = "self") -> dict:
+    """Current and peak resident set size of a process, in bytes.
 
-    Read from ``/proc/self/status`` so no extra dependency (psutil) is needed;
-    returns an empty dict on platforms without procfs.
+    Read from ``/proc/<pid>/status`` so no extra dependency (psutil) is needed;
+    returns an empty dict on platforms without procfs. ``pid`` lets the monitor
+    process report on its parent.
     """
-    status = _read_text("/proc/self/status")
+    status = _read_text(f"/proc/{pid}/status")
     if status is None:
         return {}
     wanted = {"VmRSS": "rss", "VmHWM": "peak_rss", "VmSize": "vsize"}
@@ -116,27 +121,118 @@ def _process_memory() -> dict:
     return out
 
 
-def cgroup_memory_limit() -> Optional[int]:
-    """Memory limit the job is actually held to, in bytes, or ``None``.
+def _cgroup_files(*names: str) -> List[str]:
+    """Candidate paths for a cgroup file, most specific first.
 
-    SLURM enforces ``--mem`` through cgroups, so this is the number the OOM
-    killer compares against -- not the node's total RAM that ``free`` reports.
+    ``/sys/fs/cgroup/memory.max`` alone is not enough: unless the job runs in a
+    cgroup namespace, that is the *root* cgroup and always reads "max". The
+    job's own cgroup is named in ``/proc/self/cgroup``, and the limit may sit on
+    any ancestor (SLURM usually puts it on the ``job_<id>`` level, not the task
+    level), so every ancestor is tried in turn.
     """
-    for path in (
-            "/sys/fs/cgroup/memory.max",                    # cgroup v2
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
-    ):
+    entries = _read_text("/proc/self/cgroup") or ""
+    candidates = []
+    for name in names:
+        v2 = name  # e.g. "memory.max"
+        v1 = f"memory/{name}"  # e.g. "memory/memory.limit_in_bytes"
+        for line in entries.splitlines():
+            fields = line.split(":", 2)
+            if len(fields) != 3:
+                continue
+            hierarchy_id, controllers, rel_path = fields
+            if hierarchy_id == "0" and controllers == "":
+                base, leaf = "/sys/fs/cgroup", v2
+            elif "memory" in controllers.split(","):
+                base, leaf = "/sys/fs/cgroup/memory", name
+            else:
+                continue
+            parts = [p for p in rel_path.strip("/").split("/") if p]
+            while True:
+                candidates.append(os.path.join(base, *parts, leaf))
+                if not parts:
+                    break
+                parts.pop()
+        candidates.append(os.path.join("/sys/fs/cgroup", v2))
+        candidates.append(os.path.join("/sys/fs/cgroup", v1))
+    # Preserve order, drop duplicates.
+    return list(dict.fromkeys(candidates))
+
+
+def _cgroup_value(*names: str) -> Optional[int]:
+    for path in _cgroup_files(*names):
         raw = _read_text(path)
         if raw is None or raw == "max":
             continue
         try:
-            value = int(raw)
-        except ValueError:
+            value = int(raw.split()[0])
+        except (ValueError, IndexError):
             continue
         # An unset v1 limit is reported as a huge sentinel value.
         if value < (1 << 62):
             return value
     return None
+
+
+def _slurm_memory_limit() -> Optional[int]:
+    """``--mem`` / ``--mem-per-cpu`` as SLURM exported it, in bytes."""
+    per_node = os.environ.get("SLURM_MEM_PER_NODE")
+    if per_node and per_node.isdigit():
+        return int(per_node) * 1024 * 1024
+    per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
+    if per_cpu and per_cpu.isdigit():
+        return int(per_cpu) * 1024 * 1024 * _available_cpus()
+    return None
+
+
+def cgroup_memory_limit() -> Optional[int]:
+    """Memory limit the job is actually held to, in bytes, or ``None``.
+
+    SLURM enforces ``--mem`` through cgroups, so this is the number the OOM
+    killer compares against -- not the node's total RAM that ``free`` reports.
+    Falls back to SLURM's own environment variables when the cgroup files are
+    not readable, which is common enough that guessing "unlimited" would
+    silently disable every memory warning in this module.
+    """
+    return _cgroup_value("memory.max", "memory.limit_in_bytes") or _slurm_memory_limit()
+
+
+def cgroup_memory_usage() -> Optional[int]:
+    """Bytes currently charged to the job's cgroup, or ``None``.
+
+    This is what the OOM killer watches, and it is *not* the same as the
+    process RSS: it also counts page cache and, crucially, anything the job
+    wrote to a tmpfs. A run whose RSS looks healthy can still be killed because
+    ANTs' warp fields filled ``/tmp`` in RAM -- only this number shows that.
+    """
+    return _cgroup_value("memory.current", "memory.usage_in_bytes")
+
+
+def cgroup_memory_peak() -> Optional[int]:
+    """High-water mark of the cgroup's memory usage, in bytes, or ``None``.
+
+    The single most useful number in a post-mortem: how close the *job* -- not
+    just this process -- actually came to its limit.
+    """
+    return _cgroup_value("memory.peak", "memory.max_usage_in_bytes")
+
+
+def _memory_line(pid: Union[int, str] = "self") -> str:
+    """One-line memory summary: process RSS plus the cgroup's view."""
+    parts = []
+    mem = _process_memory(pid)
+    if mem:
+        parts.append(f"rss={mem['rss'] / _GIB:.2f} GiB")
+        parts.append(f"rss_peak={mem.get('peak_rss', mem['rss']) / _GIB:.2f} GiB")
+
+    usage, peak, limit = cgroup_memory_usage(), cgroup_memory_peak(), cgroup_memory_limit()
+    if usage is not None:
+        share = f"/{limit / _GIB:.1f}" if limit else ""
+        parts.append(f"cgroup={usage / _GIB:.2f}{share} GiB")
+        if limit:
+            parts.append(f"{100 * usage / limit:.0f}% of limit")
+    if peak is not None:
+        parts.append(f"cgroup_peak={peak / _GIB:.2f} GiB")
+    return ", ".join(parts)
 
 
 def _filesystem_type(path: Union[str, Path]) -> Optional[str]:
@@ -235,6 +331,7 @@ def log_registration_environment() -> dict:
         "allocated_cpus": _available_cpus(),
         "itk_threads": os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"),
         "cgroup_memory_limit": cgroup_memory_limit(),
+        "cgroup_memory_usage": cgroup_memory_usage(),
         "tmpdir": tmpdir,
         "tmpdir_fstype": _filesystem_type(tmpdir),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
@@ -260,19 +357,52 @@ def log_registration_environment() -> dict:
 
 
 def _log_memory(stage: str, verbose: bool = False) -> None:
-    mem = _process_memory()
-    if not mem:
+    line = _memory_line()
+    if not line:
         return
-    limit = cgroup_memory_limit()
-    share = f" ({100 * mem['rss'] / limit:.0f}% of limit)" if limit else ""
-    message = (
-        f"Memory after {stage}: rss={mem['rss'] / _GIB:.2f} GiB "
-        f"peak={mem.get('peak_rss', mem['rss']) / _GIB:.2f} GiB{share}"
-    )
+    message = f"Memory after {stage}: {line}"
     if verbose:
         BaseProcessor.log_verbose(message)
     else:
         BaseProcessor.log(message)
+
+
+def enable_stuck_diagnostics() -> bool:
+    """Make the process dump its Python stack on ``SIGUSR1``.
+
+    When a job looks stuck, this turns guesswork into an answer: run
+    ``scancel --signal=USR1 <jobid>`` and the stack of every thread is written
+    to stderr, showing whether the process is really inside
+    ``ants.registration`` or blocked somewhere else entirely. The signal does
+    not kill the job, so it can be sent repeatedly -- two dumps a few minutes
+    apart distinguish "slow but progressing" from "wedged".
+
+    Returns ``False`` where the platform has no ``SIGUSR1`` (Windows).
+    """
+    if not hasattr(signal, "SIGUSR1"):
+        return False
+    try:
+        faulthandler.enable()
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=True)
+    except (AttributeError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _monitor_loop(target_pid: int, stage: str, interval: float) -> None:
+    """Body of the monitor process: report on ``target_pid`` until it goes away."""
+    started = time.monotonic()
+    while True:
+        time.sleep(interval)
+        # The parent exiting reparents us to init; stop rather than log forever.
+        if os.getppid() != target_pid or not os.path.exists(f"/proc/{target_pid}"):
+            return
+        elapsed = (time.monotonic() - started) / 60.0
+        line = _memory_line(target_pid)
+        BaseProcessor.log(
+            f"{stage} still running after {elapsed:.1f} min"
+            + (f" ({line})" if line else "")
+        )
 
 
 @contextmanager
@@ -282,9 +412,40 @@ def _heartbeat(stage: str, interval: float):
     ANTs does its work inside a single opaque call. Without a heartbeat a job
     that is swapping, thrashing or simply slow is indistinguishable from one
     that has deadlocked -- the log just stops. Set ``interval<=0`` to disable.
+
+    The monitor runs in a forked *process*, not a thread, so that it does not
+    depend on the main interpreter scheduling a Python thread: ANTsPy spends the
+    whole registration inside one call into compiled code, and a thread-based
+    heartbeat only reports if that code releases the GIL periodically. A
+    separate process is scheduled by the kernel either way and reads the
+    parent's numbers from procfs. It inherits the logging handlers through the
+    fork, so its output lands in the same log.
     """
     if interval <= 0:
         yield
+        return
+
+    try:
+        context = multiprocessing.get_context("fork")
+    except ValueError:  # no fork on this platform (Windows); fall back to a thread
+        context = None
+
+    if context is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        process = context.Process(
+            target=_monitor_loop,
+            args=(os.getpid(), stage, interval),
+            name="registration-heartbeat",
+            daemon=True,
+        )
+        process.start()
+        try:
+            yield
+        finally:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5.0)
         return
 
     stop = threading.Event()
@@ -292,16 +453,12 @@ def _heartbeat(stage: str, interval: float):
 
     def _tick():
         while not stop.wait(interval):
-            mem = _process_memory()
             elapsed = (time.monotonic() - started) / 60.0
-            if mem:
-                BaseProcessor.log(
-                    f"{stage} still running after {elapsed:.1f} min "
-                    f"(rss={mem['rss'] / _GIB:.2f} GiB, "
-                    f"peak={mem.get('peak_rss', mem['rss']) / _GIB:.2f} GiB)"
-                )
-            else:
-                BaseProcessor.log(f"{stage} still running after {elapsed:.1f} min")
+            line = _memory_line()
+            BaseProcessor.log(
+                f"{stage} still running after {elapsed:.1f} min"
+                + (f" ({line})" if line else "")
+            )
 
     thread = threading.Thread(target=_tick, name="registration-heartbeat", daemon=True)
     thread.start()
@@ -310,6 +467,26 @@ def _heartbeat(stage: str, interval: float):
     finally:
         stop.set()
         thread.join(timeout=1.0)
+
+
+def _resolve_registration_spacing(fixed: sitk.Image, moving: sitk.Image, requested):
+    """Decide the grid the registration should actually run on.
+
+    ``"moving"`` (the default) matches the fixed grid to the moving image's
+    resolution. Registering a coarse image into a much finer grid cannot recover
+    detail the moving image does not contain, but it makes every displacement
+    field -- and the CC metric's per-voxel work -- scale with the *fine* grid,
+    which is where the cost explodes.
+    """
+    if requested is None:
+        return None
+    if requested == "moving":
+        fixed_spacing = float(min(fixed.GetSpacing()))
+        moving_spacing = float(min(moving.GetSpacing()))
+        if moving_spacing <= fixed_spacing * 1.5:
+            return None  # resolutions already comparable; nothing to gain
+        return moving_spacing
+    return requested
 
 
 def _describe(name: str, image: sitk.Image) -> int:
@@ -372,6 +549,13 @@ def _require_ants(num_threads: Optional[int] = None):
     return ants
 
 
+def _load_sitk(image: ImageOrPath, label: str = "image") -> sitk.Image:
+    if not isinstance(image, sitk.Image):
+        BaseProcessor.log(f"Loading {label} from {image}")
+        image = load_volume(image)
+    return sitk.Cast(image, sitk.sitkFloat32)
+
+
 def _to_ants(image: ImageOrPath, work_dir: Optional[Path] = None, label: str = "image"):
     """Load any supported input into an ANTs image via SimpleITK.
 
@@ -382,10 +566,7 @@ def _to_ants(image: ImageOrPath, work_dir: Optional[Path] = None, label: str = "
     """
     ants = _require_ants()
     started = time.monotonic()
-    if not isinstance(image, sitk.Image):
-        BaseProcessor.log(f"Loading {label} from {image}")
-        image = load_volume(image)
-    image = sitk.Cast(image, sitk.sitkFloat32)
+    image = _load_sitk(image, label)
     voxels = _describe(label, image)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False,
@@ -439,10 +620,11 @@ def register_brains(
         fixed: ImageOrPath,
         moving: ImageOrPath,
         type_of_transform: str = "SyNCC",
+        registration_spacing: Union[str, float, None] = "moving",
         work_dir: Optional[Union[str, Path]] = None,
         num_threads: Optional[int] = None,
         verbose: bool = False,
-        heartbeat: float = 300.0,
+        heartbeat: float = 60.0,
         **kwargs,
 ) -> RegistrationResult:
     """
@@ -458,6 +640,23 @@ def register_brains(
         far the most memory-hungry. Use ``"SyNRA"`` or ``"SyN"`` for a much
         lighter mutual-information variant, or ``"Affine"`` / ``"Rigid"`` for
         linear-only alignment.
+    registration_spacing : "moving" | float | None
+        Voxel size, in mm, that the *registration* runs at. ``"moving"`` (the
+        default) drops the fixed grid to the moving image's resolution whenever
+        the fixed image is more than 1.5x finer, and does nothing otherwise.
+
+        This is the difference between a job that finishes and one that does
+        not. Cost scales with the fixed image's voxel count, and voxel count
+        scales with the cube of the resolution: registering into a 0.25 mm grid
+        instead of a 1 mm one is 64x the memory and time, while adding no
+        accuracy at all if the moving image is 1 mm -- the detail simply is not
+        there to match. Pass a float to choose the resolution yourself, or
+        ``None`` to register on the fixed image's native grid.
+
+        The transforms come back in physical space, so they remain valid for
+        the full-resolution image: hand the original fixed image to
+        :func:`apply_registration` as ``reference`` for a full-resolution warp.
+        ``warped_image`` in the result is on the registration grid.
     work_dir : str | Path, optional
         Directory for intermediate NIfTI files and ANTs' transform output. Point
         this at real scratch storage on a cluster: the default temp directory is
@@ -487,6 +686,12 @@ def register_brains(
     """
     ants = _require_ants(num_threads)
     log_registration_environment()
+    if enable_stuck_diagnostics():
+        job = os.environ.get("SLURM_JOB_ID")
+        BaseProcessor.log(
+            "If this run looks stuck, dump its Python stack without killing it: "
+            + (f"scancel --signal=USR1 {job}" if job else f"kill -USR1 {os.getpid()}")
+        )
 
     work_path = _prepare_work_dir(work_dir)
     if work_path is not None and "outprefix" not in kwargs:
@@ -495,8 +700,21 @@ def register_brains(
         kwargs["outprefix"] = str(work_path / f"reg_{os.getpid()}_")
 
     BaseProcessor.log(f"Starting {type_of_transform} registration (moving -> fixed)")
-    fixed_ants, fixed_voxels = _to_ants(fixed, work_path, "fixed")
-    moving_ants, _ = _to_ants(moving, work_path, "moving")
+    fixed_image = _load_sitk(fixed, "fixed")
+    moving_image = _load_sitk(moving, "moving")
+
+    spacing = _resolve_registration_spacing(fixed_image, moving_image, registration_spacing)
+    if spacing is not None:
+        BaseProcessor.log(
+            f"Resampling the fixed grid from {min(fixed_image.GetSpacing()):.3g} mm to "
+            f"{spacing:.3g} mm for registration. The transforms are in physical space, "
+            f"so they stay valid for the full-resolution image -- pass the original "
+            f"as `reference` to apply_registration to get a full-resolution result."
+        )
+        fixed_image = resample_to_spacing(fixed_image, spacing)
+
+    fixed_ants, fixed_voxels = _to_ants(fixed_image, work_path, "fixed")
+    moving_ants, _ = _to_ants(moving_image, work_path, "moving")
     _warn_if_oversized(fixed_voxels, type_of_transform)
     _log_memory("loading inputs")
 

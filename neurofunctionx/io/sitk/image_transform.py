@@ -18,6 +18,70 @@ def extract_nonzero_slices(sitk_image: sitk.Image) -> sitk.Image:
     return extract_roi(sitk_image, roi_nonzero_slices(sitk_image))
 
 
+def resample_to_spacing(sitk_image: sitk.Image, spacing, interpolator=sitk.sitkLinear,
+                        anti_alias: bool = True) -> sitk.Image:
+    """
+    Resample an image onto an isotropic (or per-axis) voxel size, in mm.
+
+    The physical extent, origin and direction are preserved, so any transform
+    computed on the result stays valid for the original image -- transforms map
+    physical coordinates, not voxel indices.
+
+    Mainly there to keep grids manageable: memory and runtime of deformable
+    registration scale with the voxel count, which grows with the *cube* of the
+    resolution, so going from 0.25 mm to 1 mm is a 64x reduction.
+
+    Parameters
+    ----------
+    spacing : float | sequence of float
+        Target voxel size in mm; a scalar means isotropic.
+    interpolator : int
+        ``sitk.sitkLinear`` for intensity images, ``sitk.sitkNearestNeighbor``
+        for label maps.
+    anti_alias : bool
+        Low-pass filter before downsampling, so detail finer than the new voxel
+        size folds back as blur rather than aliasing artefacts. Turn off for
+        label maps (it would blend labels) and pair that with a nearest-neighbour
+        interpolator.
+    """
+    dimension = sitk_image.GetDimension()
+    if np.isscalar(spacing):
+        new_spacing = [float(spacing)] * dimension
+    else:
+        new_spacing = [float(s) for s in spacing]
+        if len(new_spacing) != dimension:
+            raise ValueError(
+                f"spacing needs {dimension} values for a {dimension}D image, got {len(new_spacing)}"
+            )
+
+    old_spacing = sitk_image.GetSpacing()
+    old_size = sitk_image.GetSize()
+    # Round up so the resampled grid still covers the full physical extent.
+    new_size = [int(np.ceil(old_size[i] * old_spacing[i] / new_spacing[i])) for i in range(dimension)]
+
+    source = sitk_image
+    if anti_alias:
+        # Nyquist: a sigma of half the added voxel size removes the detail the
+        # coarser grid cannot represent. Zero on axes that are not downsampled.
+        sigmas = [max(0.0, (new_spacing[i] ** 2 - old_spacing[i] ** 2) ** 0.5) / 2.0
+                  for i in range(dimension)]
+        if any(s > 0 for s in sigmas):
+            source = sitk.SmoothingRecursiveGaussian(
+                sitk.Cast(sitk_image, sitk.sitkFloat32), sigmas)
+            source = sitk.Cast(source, sitk_image.GetPixelID())
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetOutputSpacing(new_spacing)
+    resampler.SetSize(new_size)
+    resampler.SetOutputOrigin(sitk_image.GetOrigin())
+    resampler.SetOutputDirection(sitk_image.GetDirection())
+    resampler.SetOutputPixelType(sitk_image.GetPixelID())
+    resampler.SetTransform(sitk.Transform())
+    resampler.SetInterpolator(interpolator)
+    resampler.SetDefaultPixelValue(0)
+    return resampler.Execute(source)
+
+
 def roi_nonzero_slices(sitk_image: sitk.Image) -> tuple:
     mask = sitk.BinaryThreshold(sitk_image, lowerThreshold=0.1, upperThreshold=1e10)
 
