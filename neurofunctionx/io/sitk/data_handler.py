@@ -1,8 +1,9 @@
 import SimpleITK as sitk
 from pathlib import Path
+from typing import Union
 
 
-def load_volume(path: Path):
+def load_volume(path: Union[str, Path]):
     path = Path(path)
     path_str = str(path)
     if path.is_dir():
