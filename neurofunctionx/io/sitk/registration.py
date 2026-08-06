@@ -52,6 +52,7 @@ from typing import List, Optional, Union
 import SimpleITK as sitk
 
 from neurofunctionx.core.BaseProcessor import BaseProcessor
+from neurofunctionx.io.data_helper import copy_existing_files
 from neurofunctionx.io.sitk.data_handler import load_volume
 from neurofunctionx.io.sitk.image_transform import resample_to_spacing
 
@@ -181,6 +182,40 @@ def _slurm_memory_limit() -> Optional[int]:
     per_cpu = os.environ.get("SLURM_MEM_PER_CPU")
     if per_cpu and per_cpu.isdigit():
         return int(per_cpu) * 1024 * 1024 * _available_cpus()
+    return None
+
+
+def _process_cpu_seconds(pid: Union[int, str] = "self") -> Optional[float]:
+    """Total CPU time a process has burned, in seconds.
+
+    The one number that separates "slow" from "wedged": resident memory sits
+    perfectly still whether a solver is iterating hard or deadlocked, but CPU
+    time only climbs when work is actually happening.
+    """
+    raw = _read_text(f"/proc/{pid}/stat")
+    if raw is None:
+        return None
+    # The command name can contain spaces and parentheses, so split after the
+    # last ')' -- from there, index 0 is the state field.
+    fields = raw.rpartition(")")[2].split()
+    try:
+        utime, stime = float(fields[11]), float(fields[12])
+    except (IndexError, ValueError):
+        return None
+    ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    return (utime + stime) / ticks
+
+
+def _process_threads(pid: Union[int, str] = "self") -> Optional[int]:
+    status = _read_text(f"/proc/{pid}/status")
+    if status is None:
+        return None
+    for line in status.splitlines():
+        if line.startswith("Threads:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
     return None
 
 
@@ -392,17 +427,48 @@ def enable_stuck_diagnostics() -> bool:
 def _monitor_loop(target_pid: int, stage: str, interval: float) -> None:
     """Body of the monitor process: report on ``target_pid`` until it goes away."""
     started = time.monotonic()
+    previous_cpu = _process_cpu_seconds(target_pid)
+    previous_wall = time.monotonic()
+    idle_ticks = 0
+
     while True:
         time.sleep(interval)
         # The parent exiting reparents us to init; stop rather than log forever.
         if os.getppid() != target_pid or not os.path.exists(f"/proc/{target_pid}"):
             return
-        elapsed = (time.monotonic() - started) / 60.0
-        line = _memory_line(target_pid)
+
+        now = time.monotonic()
+        parts = [_memory_line(target_pid)]
+
+        cpu = _process_cpu_seconds(target_pid)
+        busy = None
+        if cpu is not None and previous_cpu is not None and now > previous_wall:
+            busy = 100.0 * (cpu - previous_cpu) / (now - previous_wall)
+            parts.append(f"cpu={cpu / 60:.1f} min total, {busy:.0f}% since last check")
+            threads = _process_threads(target_pid)
+            if threads:
+                parts.append(f"threads={threads}")
+        previous_cpu, previous_wall = cpu, now
+
+        line = ", ".join(part for part in parts if part)
         BaseProcessor.log(
-            f"{stage} still running after {elapsed:.1f} min"
+            f"{stage} still running after {(now - started) / 60.0:.1f} min"
             + (f" ({line})" if line else "")
         )
+
+        # Steady memory means nothing on its own -- an iterating solver and a
+        # deadlocked one look identical. Idle CPU is the real red flag.
+        if busy is not None and busy < 5.0:
+            idle_ticks += 1
+            if idle_ticks == 3:
+                BaseProcessor.log_warn(
+                    f"{stage} has used almost no CPU for the last 3 checks. That is "
+                    f"blocked, not slow -- suspect I/O on a stalled filesystem or a "
+                    f"deadlock. Dump the stack with: scancel --signal=USR1 "
+                    f"{os.environ.get('SLURM_JOB_ID', '<jobid>')}"
+                )
+        else:
+            idle_ticks = 0
 
 
 @contextmanager
@@ -563,13 +629,17 @@ def _to_ants(image: ImageOrPath, work_dir: Optional[Path] = None, label: str = "
     NRRD, MHA, DICOM directories) and a consistent float32 cast; the on-disk
     NIfTI round-trip preserves the physical geometry (spacing/origin/direction)
     exactly, avoiding error-prone in-memory direction-matrix conversions.
+
+    The temporary file is deliberately *uncompressed*. gzip dominates the cost
+    of this round-trip -- 25 s versus 1 s for a 288M-voxel volume -- and the
+    file is deleted a moment later, so the larger size buys nothing back.
     """
     ants = _require_ants()
     started = time.monotonic()
     image = _load_sitk(image, label)
     voxels = _describe(label, image)
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False,
+    tmp = tempfile.NamedTemporaryFile(suffix=".nii", delete=False,
                                       dir=str(work_dir) if work_dir else None)
     tmp.close()
     try:
@@ -586,7 +656,7 @@ def _to_ants(image: ImageOrPath, work_dir: Optional[Path] = None, label: str = "
 
 def _ants_to_sitk(ants_image, work_dir: Optional[Path] = None) -> sitk.Image:
     ants = _require_ants()
-    tmp = tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False,
+    tmp = tempfile.NamedTemporaryFile(suffix=".nii", delete=False,
                                       dir=str(work_dir) if work_dir else None)
     tmp.close()
     try:
@@ -738,6 +808,54 @@ def register_brains(
     )
     BaseProcessor.log(f"Forward transforms: {result.forward_transforms}")
     return result
+
+
+def save_transforms(
+        transforms: Union[RegistrationResult, List[str], str, Path],
+        destination: Union[str, Path],
+) -> List[str]:
+    """
+    Copy a registration's transform files somewhere permanent.
+
+    ``forward_transforms`` and ``inverse_transforms`` are *paths to files ANTs
+    already wrote*, not in-memory objects -- so they are copied, not
+    re-serialised. Passing them to ``save_transform``/``save_any_file`` fails,
+    because those expect a ``sitk.Transform``.
+
+    They also need moving somewhere permanent: ANTs writes them under its
+    ``outprefix``, which is a temporary directory unless ``work_dir`` was given,
+    and temp directories are reaped between jobs.
+
+    Parameters
+    ----------
+    transforms : RegistrationResult | list[str] | str | Path
+        A result (its forward transforms are used) or an explicit path list.
+    destination : str | Path
+        A directory -- each file keeps its name -- or a single file path, which
+        requires there to be exactly one transform. A SyN result normally has
+        two (a warp field and an affine); re-run with
+        ``write_composite_transform=True`` to get a single ``.h5`` instead, which
+        SimpleITK can also read back with ``sitk.ReadTransform``.
+
+    Returns
+    -------
+    list[str]
+        The paths written, in the same order as the input.
+    """
+    if isinstance(transforms, RegistrationResult):
+        transforms = transforms.forward_transforms
+
+    try:
+        written = copy_existing_files(transforms, destination)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{exc} ANTs writes transforms under its outprefix, which defaults to a "
+            f"temp directory that is reaped between jobs -- pass work_dir= to "
+            f"register_brains to keep them."
+        ) from exc
+
+    BaseProcessor.log(f"Saved {len(written)} transform file(s) to {destination}")
+    return written
 
 
 def apply_registration(

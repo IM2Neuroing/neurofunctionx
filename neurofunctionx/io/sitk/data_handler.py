@@ -40,4 +40,15 @@ def load_transform(path) -> sitk.Transform:
 
 
 def save_transform(transform: sitk.Transform, path: str):
+    if not isinstance(transform, sitk.Transform):
+        # SimpleITK's own error here is an unreadable SWIG signature dump. The
+        # usual cause is handing it register_brains' forward_transforms, which
+        # are paths to files ANTs already wrote rather than a transform object.
+        raise TypeError(
+            f"save_transform expects a sitk.Transform, got {type(transform).__name__}. "
+            "If this came from register_brains, forward_transforms/inverse_transforms "
+            "are file paths on disk -- copy them with "
+            "neurofunctionx.io.sitk.registration.save_transforms(result, destination) "
+            "instead of re-serialising them."
+        )
     sitk.WriteTransform(transform, str(path))
