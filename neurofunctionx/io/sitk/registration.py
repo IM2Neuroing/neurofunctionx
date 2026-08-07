@@ -52,7 +52,6 @@ from typing import List, Optional, Union
 import SimpleITK as sitk
 
 from neurofunctionx.core.BaseProcessor import BaseProcessor
-from neurofunctionx.io.data_helper import copy_existing_files
 from neurofunctionx.io.sitk.data_handler import load_volume
 from neurofunctionx.io.sitk.image_transform import resample_to_spacing
 
@@ -669,11 +668,16 @@ def _ants_to_sitk(ants_image, work_dir: Optional[Path] = None) -> sitk.Image:
 def _prepare_work_dir(work_dir: Optional[Union[str, Path]]) -> Optional[Path]:
     if work_dir is None:
         tmpdir = tempfile.gettempdir()
+        BaseProcessor.log_warn(
+            f"No work_dir given: ANTs will write the transform files under "
+            f"{tmpdir}, which is wiped when the job ends. Whatever you plan to do "
+            f"with forward_transforms/inverse_transforms, do it before this "
+            f"process exits -- or pass work_dir=<path on scratch> so they persist."
+        )
         if _filesystem_type(tmpdir) == "tmpfs":
             BaseProcessor.log_warn(
-                f"No work_dir given and {tmpdir} is a tmpfs; ANTs intermediates "
-                "will be written to RAM and charged to the job's memory limit. "
-                "Pass work_dir=<path on scratch> to avoid this."
+                f"{tmpdir} is also a tmpfs, so those intermediates are held in RAM "
+                "and charged to the job's memory limit."
             )
         return None
     path = Path(work_dir)
@@ -808,54 +812,6 @@ def register_brains(
     )
     BaseProcessor.log(f"Forward transforms: {result.forward_transforms}")
     return result
-
-
-def save_transforms(
-        transforms: Union[RegistrationResult, List[str], str, Path],
-        destination: Union[str, Path],
-) -> List[str]:
-    """
-    Copy a registration's transform files somewhere permanent.
-
-    ``forward_transforms`` and ``inverse_transforms`` are *paths to files ANTs
-    already wrote*, not in-memory objects -- so they are copied, not
-    re-serialised. Passing them to ``save_transform``/``save_any_file`` fails,
-    because those expect a ``sitk.Transform``.
-
-    They also need moving somewhere permanent: ANTs writes them under its
-    ``outprefix``, which is a temporary directory unless ``work_dir`` was given,
-    and temp directories are reaped between jobs.
-
-    Parameters
-    ----------
-    transforms : RegistrationResult | list[str] | str | Path
-        A result (its forward transforms are used) or an explicit path list.
-    destination : str | Path
-        A directory -- each file keeps its name -- or a single file path, which
-        requires there to be exactly one transform. A SyN result normally has
-        two (a warp field and an affine); re-run with
-        ``write_composite_transform=True`` to get a single ``.h5`` instead, which
-        SimpleITK can also read back with ``sitk.ReadTransform``.
-
-    Returns
-    -------
-    list[str]
-        The paths written, in the same order as the input.
-    """
-    if isinstance(transforms, RegistrationResult):
-        transforms = transforms.forward_transforms
-
-    try:
-        written = copy_existing_files(transforms, destination)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"{exc} ANTs writes transforms under its outprefix, which defaults to a "
-            f"temp directory that is reaped between jobs -- pass work_dir= to "
-            f"register_brains to keep them."
-        ) from exc
-
-    BaseProcessor.log(f"Saved {len(written)} transform file(s) to {destination}")
-    return written
 
 
 def apply_registration(

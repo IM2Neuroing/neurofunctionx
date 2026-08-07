@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neurofunctionx"
-version = "0.1.5"
+version = "0.1.6"
 description = "Reusable helper and DBS-simulation functions for the neuro stack (I/O, image/mesh utilities, COMSOL and e-field helpers)."
 readme = "README.md"
 requires-python = ">=3.9"

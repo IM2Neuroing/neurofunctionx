@@ -178,6 +178,13 @@ class SlurmRunner(BaseProcessor):
         Passed through to sbatch when set.
     gpus : int
         ``--gpus-per-node``; omitted entirely when 0.
+    array_parallelism : int, optional
+        How many elements of a :meth:`map` array SLURM may run at once -- the
+        ``%N`` in ``--array=0-9%4``. Only affects arrays; a plain :meth:`submit`
+        is one job either way. Leave unset for submitit's default of 256, i.e.
+        as many as the queue will give you. Set it to be polite on a shared
+        partition, or when the elements contend for something the scheduler
+        cannot see: a license server, a fileserver, scratch space.
     name : str, optional
         Job name. Defaults to the submitted function's ``__name__``.
     setup : list[str], optional
@@ -203,6 +210,7 @@ class SlurmRunner(BaseProcessor):
             qos: Optional[str] = None,
             gpus: int = 0,
             nodes: int = 1,
+            array_parallelism: Optional[int] = None,
             name: Optional[str] = None,
             setup: Optional[Sequence[str]] = None,
             log_level: int = logging.INFO,
@@ -218,6 +226,7 @@ class SlurmRunner(BaseProcessor):
         self.qos = qos
         self.gpus = gpus
         self.nodes = nodes
+        self.array_parallelism = array_parallelism
         self.name = name
         self.setup = list(DEFAULT_SETUP if setup is None else setup)
         self.log_level = log_level
@@ -238,6 +247,7 @@ class SlurmRunner(BaseProcessor):
             log_dir=self.log_dir, cpus=self.cpus, mem=self.mem, time=self.time,
             partition=self.partition, account=self.account, qos=self.qos,
             gpus=self.gpus, nodes=self.nodes, name=self.name, setup=self.setup,
+            array_parallelism=self.array_parallelism,
             log_level=self.log_level, dependency=self.dependency,
         )
         extra = dict(self.slurm_extra)
@@ -288,6 +298,10 @@ class SlurmRunner(BaseProcessor):
             parameters["slurm_account"] = self.account
         if self.gpus:
             parameters["gpus_per_node"] = self.gpus
+        if self.array_parallelism:
+            # Becomes the %N in --array=0-9%N. submitit owns the --array line, so
+            # this cannot go through slurm_additional_parameters like the rest.
+            parameters["slurm_array_parallelism"] = self.array_parallelism
 
         additional = dict(self.slurm_extra)
         if self.qos:
@@ -340,7 +354,9 @@ class SlurmRunner(BaseProcessor):
 
         One array is far kinder to the scheduler than N separate submissions,
         and every element gets the same resource request -- size it for the
-        biggest one.
+        biggest one. Cap how many run at once with the runner's
+        ``array_parallelism``; the array is submitted in full either way, SLURM
+        just holds the rest back.
         """
         columns = [list(iterable) for iterable in iterables]
         if not columns:
@@ -353,9 +369,12 @@ class SlurmRunner(BaseProcessor):
 
         executor = self._executor(default_name=getattr(fn, "__name__", None))
         jobs = executor.map_array(_ConfiguredCall(fn, self.log_level), *columns)
+        throttle = (
+            f", at most {self.array_parallelism} at a time" if self.array_parallelism else ""
+        )
         self._log(
             f"Submitted array of {len(jobs)} jobs "
-            f"({getattr(fn, '__name__', fn)}, ids {jobs[0].job_id}..{jobs[-1].job_id}) "
+            f"({getattr(fn, '__name__', fn)}, ids {jobs[0].job_id}..{jobs[-1].job_id}{throttle}) "
             f"[{self._resources_text()}]"
         )
         return jobs

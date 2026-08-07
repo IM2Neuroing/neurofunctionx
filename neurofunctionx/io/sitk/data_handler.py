@@ -47,8 +47,7 @@ def save_transform(transform: sitk.Transform, path: str):
         raise TypeError(
             f"save_transform expects a sitk.Transform, got {type(transform).__name__}. "
             "If this came from register_brains, forward_transforms/inverse_transforms "
-            "are file paths on disk -- copy them with "
-            "neurofunctionx.io.sitk.registration.save_transforms(result, destination) "
-            "instead of re-serialising them."
+            "are paths to files ANTs already wrote -- pass them to save_any_file, "
+            "which copies them, rather than re-serialising them here."
         )
     sitk.WriteTransform(transform, str(path))
