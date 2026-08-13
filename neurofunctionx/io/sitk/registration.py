@@ -23,6 +23,11 @@ Two failure modes dominate on SLURM, and both are handled here:
   which defaults into ``$TMPDIR``/``/tmp``. Where that is a tmpfs, every byte is
   RAM charged to the job. Pass ``work_dir=`` pointing at real scratch.
 
+The facts about the allocation itself -- CPU count, job id, which filesystem a
+path is on -- come from :mod:`neurofunctionx.cluster.resources`, which knows
+nothing about ITK or ANTs and is therefore safe to consult before they load.
+This module only turns those numbers into ITK settings.
+
 Call :func:`log_registration_environment` once at job start to get the resolved
 thread count and temp-directory filesystem into the log. Logging goes through
 :class:`BaseProcessor`, so ``BaseProcessor.configure_logging()`` controls it.
@@ -34,7 +39,6 @@ import select
 import signal
 import sys
 import tempfile
-import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,6 +47,11 @@ from typing import List, Optional, Union
 
 import SimpleITK as sitk
 
+from neurofunctionx.cluster.resources import (
+    allocated_cpus,
+    describe_environment,
+    filesystem_type,
+)
 from neurofunctionx.core.BaseProcessor import BaseProcessor
 from neurofunctionx.io.sitk.data_handler import load_volume
 from neurofunctionx.io.sitk.image_transform import resample_to_spacing
@@ -79,44 +88,6 @@ class RegistrationResult:
 # Environment
 # --------------------------------------------------------------------------- #
 
-def _filesystem_type(path: Union[str, Path]) -> Optional[str]:
-    """Filesystem type backing ``path``, e.g. ``"tmpfs"`` or ``"ext4"``."""
-    try:
-        with open("/proc/mounts") as handle:
-            mounts = handle.read()
-        target = os.path.realpath(path)
-    except OSError:
-        return None
-
-    # Longest matching mount point wins.
-    best_len, best_type = -1, None
-    for line in mounts.splitlines():
-        fields = line.split()
-        if len(fields) < 3:
-            continue
-        mount_point, fs_type = fields[1], fields[2]
-        if (target == mount_point or target.startswith(mount_point.rstrip("/") + "/")) \
-                and len(mount_point) > best_len:
-            best_len, best_type = len(mount_point), fs_type
-    return best_type
-
-
-def _available_cpus() -> int:
-    """CPUs this job may actually use.
-
-    ``SLURM_CPUS_PER_TASK`` is authoritative inside a job step; the affinity mask
-    is the fallback. Both are far smaller than ``os.cpu_count()`` on a shared
-    node.
-    """
-    for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
-        value = os.environ.get(var)
-        if value and value.isdigit() and int(value) > 0:
-            return int(value)
-    if hasattr(os, "sched_getaffinity"):
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count() or 1
-
-
 def _configure_threads(num_threads: Optional[int] = None) -> int:
     """Pin ITK/OpenMP thread counts to the allocation, before ANTsPy loads.
 
@@ -126,7 +97,7 @@ def _configure_threads(num_threads: Optional[int] = None) -> int:
     """
     global _threads_configured
 
-    threads = max(1, int(num_threads or _available_cpus()))
+    threads = max(1, int(num_threads or allocated_cpus()))
 
     node_cpus = os.cpu_count() or threads
     if num_threads is None and node_cpus > threads:
@@ -165,36 +136,51 @@ def log_registration_environment() -> dict:
     """Log (and return) the resources this process is really running under.
 
     Worth calling once at the top of a batch job: it puts the difference between
-    the node's hardware and the job's allocation into the log.
+    the node's hardware and the job's allocation into the log, with the resolved
+    ITK thread count beside it.
     """
-    tmpdir = tempfile.gettempdir()
-    info = {
-        "node_cpus": os.cpu_count(),
-        "allocated_cpus": _available_cpus(),
-        "itk_threads": os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"),
-        "tmpdir": tmpdir,
-        "tmpdir_fstype": _filesystem_type(tmpdir),
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-    }
-    BaseProcessor.log(
-        f"Registration environment: job={info['slurm_job_id']} "
-        f"node_cpus={info['node_cpus']} allocated_cpus={info['allocated_cpus']} "
-        f"itk_threads={info['itk_threads']} "
-        f"tmpdir={tmpdir} ({info['tmpdir_fstype'] or 'unknown fs'})"
+    info = describe_environment(
+        label="Registration environment",
+        extra={"itk_threads": os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS")},
     )
     if info["tmpdir_fstype"] == "tmpfs":
         BaseProcessor.log_warn(
-            f"Temp directory {tmpdir} is a tmpfs: files written there consume "
-            "RAM and count against the job's memory limit. ANTs warp fields are "
-            "several hundred MB each -- pass work_dir=<scratch on disk> to "
-            "register_brains, or export TMPDIR to node-local storage."
+            "ANTs warp fields are several hundred MB each, so that applies to "
+            "this run: pass work_dir=<scratch on disk> to register_brains."
         )
     return info
 
 
+def _die_with_parent() -> None:
+    """Ask the kernel to SIGKILL this process when its parent dies.
+
+    The last line of defence against a monitor that outlives the job. Every
+    other stop signal -- the pipe, SIGTERM, the getppid() check -- needs this
+    process to be running Python to act on it; ``PR_SET_PDEATHSIG`` does not.
+    Linux-only and best effort: a failure here costs nothing, because the checks
+    in the loop still apply.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # 1 == PR_SET_PDEATHSIG
+    except Exception:  # pragma: no cover - platform / libc quirk
+        pass
+
+
 def _monitor_loop(target_pid: int, stage: str, interval: float,
                   stop_fd: int, parent_fd: int) -> None:
-    """Body of the monitor process: report until the parent says stop."""
+    """Body of the monitor process: report until the parent says stop.
+
+    Every exit from here goes through ``os._exit``. Returning normally would
+    hand control back to ``multiprocessing``'s bootstrap, which runs
+    ``util._exit_function()`` -- and ``util._finalizer_registry`` is inherited
+    through the fork and *not* cleared, so this process would run finalizers
+    that belong to the parent (a pool's ``terminate``, a shared-memory unlink)
+    against resources it does not own. Those block indefinitely, which is how a
+    monitor that was told to stop ends up wedged instead of dead.
+    """
     os.close(parent_fd)  # our copy of the write end, or we never see the EOF
 
     # A fork inherits the parent's signal handlers, and submitit installs one
@@ -209,6 +195,7 @@ def _monitor_loop(target_pid: int, stage: str, interval: float,
                 signal.signal(signum, signal.SIG_DFL)
             except (OSError, ValueError):  # pragma: no cover - platform quirk
                 pass
+    _die_with_parent()
 
     started = time.monotonic()
     while True:
@@ -217,12 +204,12 @@ def _monitor_loop(target_pid: int, stage: str, interval: float,
         # signals are being intercepted.
         try:
             if select.select([stop_fd], [], [], interval)[0]:
-                return
+                os._exit(0)
         except (InterruptedError, OSError):
-            return
+            os._exit(0)
         # The parent exiting reparents us to init; stop rather than log forever.
         if os.getppid() != target_pid or not os.path.exists(f"/proc/{target_pid}"):
-            return
+            os._exit(0)
         elapsed = (time.monotonic() - started) / 60.0
         BaseProcessor.log(f"{stage} still running after {elapsed:.1f} min")
 
@@ -235,68 +222,54 @@ def _heartbeat(stage: str, interval: float):
     stops and a slow run is indistinguishable from a deadlocked one. Set
     ``interval<=0`` to disable.
 
-    The monitor runs in a forked *process*: ANTsPy spends the whole registration
-    in compiled code, and a thread-based heartbeat only reports if that code
-    releases the GIL. A process is scheduled by the kernel either way, and
-    inherits the logging handlers through the fork.
+    The monitor runs in a forked *process*, on the assumption that ANTsPy spends
+    the whole registration in compiled code that never releases the GIL, so a
+    thread would not be scheduled to report. A process is scheduled by the kernel
+    either way, and inherits the logging handlers through the fork.
+
+    That assumption has not been measured. If ANTsPy does release the GIL, a
+    plain daemon thread would do the same job without a fork, and with it would
+    go the inherited signal handlers, the stop pipe and the daemon-child join at
+    interpreter exit -- every sharp edge in this file. Worth an afternoon.
+
+    ``register_brains`` is the only caller and refuses to run off Linux, so fork
+    is always available here; there is deliberately no fallback.
     """
     if interval <= 0:
         yield
         return
 
-    try:
-        context = multiprocessing.get_context("fork")
-    except ValueError:  # no fork on this platform (Windows)
-        context = None
-
-    if context is not None:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        stop_fd, parent_fd = os.pipe()
-        process = context.Process(
-            target=_monitor_loop,
-            args=(os.getpid(), stage, interval, stop_fd, parent_fd),
-            name="registration-heartbeat",
-            daemon=True,
-        )
-        process.start()
-        os.close(stop_fd)  # the monitor owns the read end from here on
-        try:
-            yield
-        finally:
-            # Closing the pipe is the primary stop signal; the escalation below
-            # only matters if the monitor is wedged. Never leave this block with
-            # the child alive: multiprocessing joins daemon children at exit
-            # without a timeout, so a survivor hangs the whole job.
-            os.close(parent_fd)
-            process.join(timeout=5.0)
-            for escalate in (process.terminate, process.kill):
-                if not process.is_alive():
-                    break
-                escalate()
-                process.join(timeout=5.0)
-            if process.is_alive():
-                BaseProcessor.log_warn(
-                    "The heartbeat monitor did not exit. It is a daemon process, "
-                    "so the interpreter will try to join it at exit and may hang."
-                )
-        return
-
-    stop = threading.Event()
-    started = time.monotonic()
-
-    def _tick():
-        while not stop.wait(interval):
-            elapsed = (time.monotonic() - started) / 60.0
-            BaseProcessor.log(f"{stage} still running after {elapsed:.1f} min")
-
-    thread = threading.Thread(target=_tick, name="registration-heartbeat", daemon=True)
-    thread.start()
+    context = multiprocessing.get_context("fork")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    stop_fd, parent_fd = os.pipe()
+    process = context.Process(
+        target=_monitor_loop,
+        args=(os.getpid(), stage, interval, stop_fd, parent_fd),
+        name="registration-heartbeat",
+        daemon=True,
+    )
+    process.start()
+    os.close(stop_fd)  # the monitor owns the read end from here on
     try:
         yield
     finally:
-        stop.set()
-        thread.join(timeout=1.0)
+        # Closing the pipe is the primary stop signal; the escalation below only
+        # matters if the monitor is wedged. Never leave this block with the child
+        # alive: multiprocessing joins daemon children at exit without a timeout,
+        # so a survivor hangs the whole job.
+        os.close(parent_fd)
+        process.join(timeout=5.0)
+        for escalate in (process.terminate, process.kill):
+            if not process.is_alive():
+                break
+            escalate()
+            process.join(timeout=5.0)
+        if process.is_alive():
+            BaseProcessor.log_warn(
+                "The heartbeat monitor did not exit. It is a daemon process, so "
+                "the interpreter will try to join it at exit and may hang."
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -427,7 +400,7 @@ def _prepare_work_dir(work_dir: Optional[Union[str, Path]]) -> Optional[Path]:
             f"{tmpdir}, which is wiped when the job ends. Use them before this "
             f"process exits, or pass work_dir=<path on scratch> so they persist."
         )
-        if _filesystem_type(tmpdir) == "tmpfs":
+        if filesystem_type(tmpdir) == "tmpfs":
             BaseProcessor.log_warn(
                 f"{tmpdir} is also a tmpfs, so those intermediates are held in RAM "
                 "and charged to the job's memory limit."
@@ -435,7 +408,7 @@ def _prepare_work_dir(work_dir: Optional[Union[str, Path]]) -> Optional[Path]:
         return None
     path = Path(work_dir)
     path.mkdir(parents=True, exist_ok=True)
-    BaseProcessor.log(f"Using work_dir {path} ({_filesystem_type(path) or 'unknown fs'})")
+    BaseProcessor.log(f"Using work_dir {path} ({filesystem_type(path) or 'unknown fs'})")
     return path
 
 
