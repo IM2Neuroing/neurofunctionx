@@ -3,34 +3,11 @@ High-quality registration of two skull-stripped brains.
 
 Wraps ANTsPy so a single call performs the rigid -> affine -> SyN deformable
 registration with the cross-correlation (CC) metric that is the research-grade
-standard for brain-to-brain warping. Brains may be ``sitk.Image`` objects or any
-path readable by :func:`load_volume`; warped results come back as ``sitk.Image``.
+standard for brain-to-brain warping. Brains may be ``sitk.Image``; warped results come back as ``sitk.Image``.
 
 Requires the optional ``registration`` extra::
 
     pip install "neurofunctionx[registration]"      # installs antspyx
-
-Running on a cluster
---------------------
-Two failure modes dominate on SLURM, and both are handled here:
-
-* **Thread oversubscription.** ITK sizes its thread pool from the node's core
-  count, not the cores cgroups granted the job, so a 64-core node with
-  ``--cpus-per-task=8`` gets 64 ANTs worker threads. The CC metric allocates
-  per-thread buffers, so peak memory grows with that wrong count while 8 real
-  cores thrash. This module pins the thread count before ANTsPy is imported.
-* **Temporary files on tmpfs.** ANTs streams warp fields through ``outprefix``,
-  which defaults into ``$TMPDIR``/``/tmp``. Where that is a tmpfs, every byte is
-  RAM charged to the job. Pass ``work_dir=`` pointing at real scratch.
-
-The facts about the allocation itself -- CPU count, job id, which filesystem a
-path is on -- come from :mod:`neurofunctionx.cluster.resources`, which knows
-nothing about ITK or ANTs and is therefore safe to consult before they load.
-This module only turns those numbers into ITK settings.
-
-Call :func:`log_registration_environment` once at job start to get the resolved
-thread count and temp-directory filesystem into the log. Logging goes through
-:class:`BaseProcessor`, so ``BaseProcessor.configure_logging()`` controls it.
 """
 import multiprocessing
 import os
@@ -221,19 +198,6 @@ def _heartbeat(stage: str, interval: float):
     ANTs does its work inside a single opaque call, so without this the log just
     stops and a slow run is indistinguishable from a deadlocked one. Set
     ``interval<=0`` to disable.
-
-    The monitor runs in a forked *process*, on the assumption that ANTsPy spends
-    the whole registration in compiled code that never releases the GIL, so a
-    thread would not be scheduled to report. A process is scheduled by the kernel
-    either way, and inherits the logging handlers through the fork.
-
-    That assumption has not been measured. If ANTsPy does release the GIL, a
-    plain daemon thread would do the same job without a fork, and with it would
-    go the inherited signal handlers, the stop pipe and the daemon-child join at
-    interpreter exit -- every sharp edge in this file. Worth an afternoon.
-
-    ``register_brains`` is the only caller and refuses to run off Linux, so fork
-    is always available here; there is deliberately no fallback.
     """
     if interval <= 0:
         yield
@@ -356,10 +320,6 @@ def _to_ants(image: ImageOrPath, work_dir: Optional[Path] = None, label: str = "
     Routing through :func:`load_volume` gives uniform format handling and a
     consistent float32 cast, and the on-disk NIfTI round-trip preserves the
     physical geometry exactly, avoiding in-memory direction-matrix conversions.
-
-    The temporary file is deliberately *uncompressed*: gzip dominates the cost of
-    the round-trip (25 s versus 1 s for a 288M-voxel volume) and the file is
-    deleted a moment later.
     """
     ants = _require_ants()
     started = time.monotonic()
@@ -578,10 +538,7 @@ def apply_registration(
     missing = [t for t in transforms if isinstance(t, (str, Path)) and not Path(t).exists()]
     if missing:
         raise FileNotFoundError(
-            f"Transform file(s) no longer on disk: {missing}. ANTs writes them "
-            "under its outprefix (a temp directory by default), so they can be "
-            "cleaned up between jobs -- pass work_dir= to register_brains to "
-            "keep them somewhere persistent."
+            f"Transform file(s) not found: {missing}."
         )
 
     BaseProcessor.log(

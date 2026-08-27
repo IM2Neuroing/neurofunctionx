@@ -3,6 +3,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Union
 
 
 def _content_extension(name: str) -> str:
@@ -63,7 +64,9 @@ def copy_existing_files(sources, destination) -> list:
     return [str(item) for item in targets]
 
 
-def save_any_file(file, file_path: Path):
+def save_any_file(file, file_path: Union[Path, str]):
+    if type(file_path) is str:
+        file_path = Path(file_path)
     name = file_path.name
     if name.endswith(".json"):
         with open(str(file_path), "w+") as outfile:
@@ -123,13 +126,13 @@ def get_sidecar_name_of_file(file_path) -> str:
 
 
 _BIDS_NAME_PATTERN = re.compile(
-    r"ses-(?P<session>[^_]+)"        # session (required)
-    r"(?:_acq-(?P<acq>[^_]+))?"      # optional acq
+    r"ses-(?P<session>[^_]+)"  # session (required)
+    r"(?:_acq-(?P<acq>[^_]+))?"  # optional acq
     r"(?:_space-(?P<space>[^_]+))?"  # optional space
-    r"(?:_run-(?P<run>[^_]+))?"      # optional run
+    r"(?:_run-(?P<run>[^_]+))?"  # optional run
     r"(?:_(?P<structure>[^_\.]+))?"  # optional structure
-    r"_(?P<suffix>[^\.]+)"           # suffix (required)
-    r"(?P<ext>\..+)$"                # extension (anything)
+    r"_(?P<suffix>[^\.]+)"  # suffix (required)
+    r"(?P<ext>\..+)$"  # extension (anything)
 )
 
 
