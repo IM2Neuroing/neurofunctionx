@@ -21,7 +21,7 @@ class N4Striper(BaseProcessor):
         return corrector.Execute(image, mask_image)
 
     @staticmethod
-    def skull_strip(self, files, masks, overwrite=False):
+    def skull_strip(files, masks, brains, overwrite=False):
         """Skull-strip each file with HD-BET and apply the resulting mask.
 
         ``files`` / ``masks`` are aligned lists of file paths (the mask paths are
@@ -39,9 +39,5 @@ class N4Striper(BaseProcessor):
                                      num_processes_preprocessing=4, num_processes_segmentation_export=8,
                                      folder_with_segs_from_prev_stage=None, num_parts=1, part_id=0)
 
-        brains = []
-        for file, mask in zip(files, masks):
-            brain = file.replace("_N4_", "_N4-Brain_")
+        for file, mask, brain in zip(files, masks, brains):
             apply_bet(file, mask, brain)
-            brains.append(brain)
-        return brains
